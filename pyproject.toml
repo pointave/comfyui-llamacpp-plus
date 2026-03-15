@@ -1,0 +1,29 @@
+[project]
+name = "llamacpp-plus"
+description = "Access llama.cpp server, plus ease-of-life functionality"
+version = "1.0.0"
+license = {file = "LICENSE"} 
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[project.urls]
+Repository = "https://github.com/pointave/comfyui-llamacpp-plus"
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/pointave/comfyui-llamacpp-plus/wiki"
+"Bug Tracker" = "https://github.com/pointave/comfyui-llamacpp-plus/issues"
+
+[tool.comfy]
+PublisherId = "pointave"
+DisplayName = "llamacpp plus"
+Icon = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/icon.png"
+Banner = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/banner.png"
+includes = []
+requires-comfyui = ">=1.0.0"  # ComfyUI version compatibility
