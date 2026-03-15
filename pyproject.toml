@@ -1,5 +1,5 @@
 [project]
-name = "llamacpp-plus"
+name = "comfyui-llamacpp-plus"
 description = "Access llama.cpp server, plus ease-of-life functionality"
 version = "1.0.0"
 license = {file = "LICENSE"} 
@@ -22,8 +22,6 @@ Documentation = "https://github.com/pointave/comfyui-llamacpp-plus/wiki"
 
 [tool.comfy]
 PublisherId = "point-aveugle"
-DisplayName = "llamacpp plus"
-Icon = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/icon.png"
-Banner = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/banner.png"
+DisplayName = "comfyui-llamacpp plus"
 includes = []
 requires-comfyui = ">=1.0.0"  # ComfyUI version compatibility
