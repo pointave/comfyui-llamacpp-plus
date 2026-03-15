@@ -22,6 +22,6 @@ Documentation = "https://github.com/pointave/comfyui-llamacpp-plus/wiki"
 
 [tool.comfy]
 PublisherId = "point-aveugle"
-DisplayName = "comfyui-llamacpp plus"
+DisplayName = "comfyui-llamacpp-plus"
 includes = []
 requires-comfyui = ">=1.0.0"  # ComfyUI version compatibility
