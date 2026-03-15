@@ -21,7 +21,7 @@ Documentation = "https://github.com/pointave/comfyui-llamacpp-plus/wiki"
 "Bug Tracker" = "https://github.com/pointave/comfyui-llamacpp-plus/issues"
 
 [tool.comfy]
-PublisherId = "pointave"
+PublisherId = "point-aveugle"
 DisplayName = "llamacpp plus"
 Icon = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/icon.png"
 Banner = "https://raw.githubusercontent.com/pointave/comfyui-llamacpp-plus/main/banner.png"
