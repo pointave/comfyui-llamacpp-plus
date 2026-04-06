@@ -109,6 +109,7 @@ def _filter_enabled_options(options: dict[str, Any] | None) -> dict[str, Any] | 
         "enable_num_ctx", "enable_repeat_last_n", "enable_repeat_penalty",
         "enable_temperature", "enable_seed", "enable_stop", "enable_tfs_z",
         "enable_num_predict", "enable_top_k", "enable_top_p", "enable_min_p",
+        "enable_thinking_budget",
     ]
     out: dict[str, Any] = {}
     for enabler in enablers:
@@ -130,6 +131,52 @@ def _images_to_b64(images: list) -> list[str]:
     return result
 
 
+def _sample_video_frames(images, max_frames: int = 60, frame_step: int = 1) -> list:
+    """
+    Sample frames from a video batch tensor.
+    frame_step=1 â†’ every frame; frame_step=2 â†’ every 2nd frame, etc.
+    Result is hard-capped at max_frame.
+    """
+    total = len(images)
+    if total == 0:
+        return []
+    indices = list(range(0, total, max(1, frame_step)))
+    if len(indices) > max_frames:
+        factor = len(indices) / max_frames
+        indices = [indices[int(i * factor)] for i in range(max_frames)]
+    return [images[i] for i in indices]
+
+
+def _audio_tensor_to_b64(waveform, sample_rate: int, max_seconds: float = 30.0) -> tuple[str, str]:
+    import io, wave, struct
+    import numpy as np
+    import base64
+
+    max_samples = int(max_seconds * sample_rate)
+    if waveform.shape[-1] > max_samples:
+        waveform = waveform[..., :max_samples]
+        print(f"[LlamaCPP] Audio trimmed to {max_seconds}s")
+
+    # Convert to 16-bit PCM numpy â€” no torchaudio needed
+    audio_np = waveform.cpu().numpy()                       # [channels, samples]
+    if audio_np.ndim == 1:
+        audio_np = audio_np[np.newaxis, :]                  # ensure [channels, samples]
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+    pcm = (audio_np * 32767).astype(np.int16)               # float32 â†’ int16
+
+    n_channels, n_samples = pcm.shape
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(2)                                   # 16-bit = 2 bytes
+        wf.setframerate(sample_rate)
+        # wave expects interleaved samples: [L0,R0,L1,R1,...] â†’ transpose then flatten
+        wf.writeframes(pcm.T.flatten().tobytes())
+    buf.seek(0)
+    data = base64.b64encode(buf.read()).decode("utf-8")
+    return data, "audio/wav"
+
+
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
@@ -148,9 +195,9 @@ def _pil_to_tensor(img: Image.Image):
 
 def _render_html(text: str, width: int = 800, height: int = 600, js_delay: int = 500):
     """
-    Render HTML string to PIL Image via playwright (Chromium).
+    Render HTML string to PIL Image via playwright (Chromium headless).
     Runs sync_playwright in a thread to avoid asyncio conflicts in ComfyUI.
-    Returns (Image, err).
+    Returns (Image, err_string_or_None).
     pip install playwright && playwright install chromium
     """
     m = re.search(r"<!DOCTYPE[\s\S]*?</html>", text, re.IGNORECASE)
@@ -200,27 +247,44 @@ class LlamaCPPOptions:
     def INPUT_TYPES(s):
         seed = random.randint(1, 2 ** 31)
         return {"required": {
-            "enable_seed":           ("BOOLEAN", {"default": False}),
-            "seed":                  ("INT",     {"default": seed, "min": 0,   "max": 2**31, "step": 1}),
-            "enable_num_ctx":        ("BOOLEAN", {"default": False}),
-            "num_ctx":               ("INT",     {"default": 2048, "min": 0,   "max": 2**31, "step": 1}),
-            "enable_repeat_last_n":  ("BOOLEAN", {"default": False}),
-            "repeat_last_n":         ("INT",     {"default": 64,   "min": -1,  "max": 64,    "step": 1}),
-            "enable_repeat_penalty": ("BOOLEAN", {"default": False}),
-            "repeat_penalty":        ("FLOAT",   {"default": 1.1,  "min": 0,   "max": 2,     "step": 0.05}),
-            "enable_temperature":    ("BOOLEAN", {"default": False}),
-            "temperature":           ("FLOAT",   {"default": 0.8,  "min": -10, "max": 10,    "step": 0.05}),
-            "enable_stop":           ("BOOLEAN", {"default": False}),
-            "stop":                  ("STRING",  {"default": "",   "multiline": False}),
-            "enable_top_k":          ("BOOLEAN", {"default": False}),
-            "top_k":                 ("INT",     {"default": 40,   "min": 0,   "max": 100,   "step": 1}),
-            "enable_top_p":          ("BOOLEAN", {"default": False}),
-            "top_p":                 ("FLOAT",   {"default": 0.9,  "min": 0,   "max": 1,     "step": 0.05}),
-            "enable_min_p":          ("BOOLEAN", {"default": False}),
-            "min_p":                 ("FLOAT",   {"default": 0.0,  "min": 0,   "max": 1,     "step": 0.05}),
-            "enable_main_gpu":       ("BOOLEAN", {"default": False}),
-            "main_gpu":              ("INT",     {"default": 0,    "min": 0,   "max": 100,   "step": 1}),
-            "debug":                 ("BOOLEAN", {"default": False}),
+            # â”€â”€ Sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            "enable_seed":            ("BOOLEAN", {"default": False}),
+            "seed":                   ("INT",     {"default": seed, "min": 0,   "max": 2**31, "step": 1}),
+            "enable_num_ctx":         ("BOOLEAN", {"default": False}),
+            "num_ctx":                ("INT",     {"default": 2048, "min": 0,   "max": 2**31, "step": 1}),
+            "enable_repeat_last_n":   ("BOOLEAN", {"default": False}),
+            "repeat_last_n":          ("INT",     {"default": 64,   "min": -1,  "max": 64,    "step": 1}),
+            "enable_repeat_penalty":  ("BOOLEAN", {"default": False}),
+            "repeat_penalty":         ("FLOAT",   {"default": 1.1,  "min": 0,   "max": 2,     "step": 0.05}),
+            "enable_temperature":     ("BOOLEAN", {"default": False}),
+            "temperature":            ("FLOAT",   {"default": 0.8,  "min": -10, "max": 10,    "step": 0.05}),
+            "enable_stop":            ("BOOLEAN", {"default": False}),
+            "stop":                   ("STRING",  {"default": "",   "multiline": False}),
+            "enable_top_k":           ("BOOLEAN", {"default": False}),
+            "top_k":                  ("INT",     {"default": 40,   "min": 0,   "max": 100,   "step": 1}),
+            "enable_top_p":           ("BOOLEAN", {"default": False}),
+            "top_p":                  ("FLOAT",   {"default": 0.9,  "min": 0,   "max": 1,     "step": 0.05}),
+            "enable_min_p":           ("BOOLEAN", {"default": False}),
+            "min_p":                  ("FLOAT",   {"default": 0.0,  "min": 0,   "max": 1,     "step": 0.05}),
+            "enable_main_gpu":        ("BOOLEAN", {"default": False}),
+            "main_gpu":               ("INT",     {"default": 0,    "min": 0,   "max": 100,   "step": 1}),
+            # â”€â”€ Thinking budget (Gemma4 / QwQ style) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            "enable_thinking_budget": ("BOOLEAN", {"default": False,
+                                        "tooltip": "Cap reasoning tokens (Gemma4, QwQ). 0 disables thinking entirely."}),
+            "thinking_budget":        ("INT",     {"default": 1024, "min": 0,   "max": 32768, "step": 128}),
+            # â”€â”€ Video â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            "video_frame_step":       ("INT",     {"default": 1,  "min": 1, "max": 60, "step": 1,
+                                        "tooltip": "Sample every Nth source frame from the video input. "
+                                                   "1 = every frame."}),
+            "video_max_frames":       ("INT",     {"default": 60, "min": 1, "max": 60, "step": 1,
+                                        "tooltip": "Hard cap on frames sent to model. "
+                                                   "Video"}),
+            # â”€â”€ Audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            "audio_max_seconds":      ("FLOAT",   {"default": 30.0, "min": 1.0, "max": 30.0, "step": 1.0,
+                                        "tooltip": "Trim audio to this many seconds before sending. "
+                                                   "Gemma4 E2B/E4B hard limit is 30 s."}),
+            # â”€â”€ Debug â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            "debug":                  ("BOOLEAN", {"default": False}),
         }}
 
     RETURN_TYPES = ("LLAMACPP_OPTIONS",)
@@ -260,8 +324,8 @@ class LlamaCPPConnectivity:
 
 class LlamaCPPVisualizerHTML:
     """
-    Takes the html_output from LlamaCPPChat and renders it to a ComfyUI IMAGE.
-    Connect image output to a Preview Image node to see the chart.
+    Renders an HTML string to a ComfyUI IMAGE via Playwright (Chromium headless).
+    Wire result from LlamaCPPChat â†’ html, then IMAGE â†’ Preview Image node.
     pip install playwright && playwright install chromium
     """
     @classmethod
@@ -281,44 +345,88 @@ class LlamaCPPVisualizerHTML:
 
     def run(self, html: str, width: int = 800, height: int = 600, js_delay_ms: int = 500):
         if not html or not html.strip():
-            print("[LlamaCPP HTML] empty input — nothing to render")
+            print("[LlamaCPP HTML] empty input â€” nothing to render")
             return (_blank_tensor(width, height),)
         img, err = _render_html(html, width, height, js_delay_ms)
         if err:
             print(f"[LlamaCPP HTML] ERROR: {err}")
             return (_blank_tensor(width, height),)
-        print(f"[LlamaCPP HTML] OK — rendered {img.size}")
+        print(f"[LlamaCPP HTML] OK â€” rendered {img.size}")
         return (_pil_to_tensor(img),)
 
 
 class LlamaCPPChat:
+    """
+    Chat node for llama.cpp.  Supports text, images, video (frame batch), and audio.
+
+    media_mode selects which optional socket is active:
+      none  â€” text only; media inputs are ignored even if wired
+      image â€” wire IMAGE for still frames
+      video â€” wire IMAGE batch treated as temporal video; sampling in Options
+      audio â€” wire AUDIO (Gemma4 E2B/E4B, 30 s max)
+
+    visualization injects HTML generation instructions into the system prompt:
+      disabled â€” system prompt used as-is
+      html     â€” overrides system prompt to force a full HTML document output;
+                 html_image carries a Playwright-rendered IMAGE of it
+
+    html_render_width / html_render_height / html_render_delay_ms
+      Control the viewport used when auto-rendering html_image.
+      Right-click any of these â†’ Convert to Input to wire a Primitive.
+    """
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "system":        ("STRING",  {"multiline": True, "default": "You are an AI assistant."}),
-                "prompt":        ("STRING",  {"multiline": True, "default": "Hello!"}),
-                "think":         ("BOOLEAN", {"default": False}),
-                "format":        (["text", "json"],),
-                "visualization": (["disabled", "html"], {"default": "disabled",
-                    "tooltip": "html → injects HTML chart instructions, extract via html_output"}),
-                "reset_session": ("BOOLEAN", {"default": False}),
+                "system":               ("STRING",  {"multiline": True,  "default": "You are an AI assistant."}),
+                "prompt":               ("STRING",  {"multiline": True,  "default": "Hello!"}),
+                "think":                ("BOOLEAN", {"default": False}),
+                "format":               (["text", "json"],),
+                "reset_session":        ("BOOLEAN", {"default": True}),
+                "media_mode":           (["none", "image", "video", "audio"], {"default": "none",
+                                          "tooltip": "Which optional media socket to process. "
+                                                     "none=text only (inputs ignored even if wired), "
+                                                     "image=still frames, video=temporal batch, "
+                                                     "audio=AUDIO input (Gemma4 E2B/E4B only)"}),
             },
             "optional": {
-                "connectivity":  ("LLAMACPP_CONNECTIVITY", {"forceInput": False}),
-                "options":       ("LLAMACPP_OPTIONS",      {"forceInput": False}),
-                "images":        ("IMAGE",                 {"forceInput": False}),
+                "connectivity":         ("LLAMACPP_CONNECTIVITY", {"forceInput": False}),
+                "options":              ("LLAMACPP_OPTIONS",      {"forceInput": False}),
+                # â”€â”€ Media sockets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                "images":               ("IMAGE", {"forceInput": False,
+                                          "tooltip": "Active when media_mode=image"}),
+                "video":                ("IMAGE", {"forceInput": False,
+                                          "tooltip": "Active when media_mode=video. "
+                                                     "Batch treated as temporal frames. "
+                                                     "Max 60 frames."}),
+                "audio":                ("AUDIO", {"forceInput": False,
+                                          "tooltip": "Active when media_mode=audio. "
+                                                     "Gemma4 E2B/E4B only. Max 30 s."}),
+                # â”€â”€ HTML render size (for html_image auto-render) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # Right-click any of these â†’ Convert to Input to wire a Primitive.
+                "html_render_width":    ("INT",   {"default": 800,  "min": 64, "max": 4096, "step": 8}),
+                "html_render_height":   ("INT",   {"default": 600,  "min": 64, "max": 4096, "step": 8}),
+                "html_render_delay_ms": ("INT",   {"default": 500,  "min": 0,  "max": 5000, "step": 100}),
+                # â”€â”€ Visualization mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                "visualization":        (["disabled", "html"], {"default": "disabled",
+                                          "tooltip": "html â†’ forces HTML doc output and "
+                                                     "renders the result to html_image"}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("result", "thinking", "html_output")
+    # Outputs: result, thinking, html_image  (html_output removed)
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE")
+    RETURN_NAMES = ("result", "thinking", "html_image")
     FUNCTION = "run"
     CATEGORY = "LlamaCPP API"
     DESCRIPTION = (
         "Chat with llama.cpp. "
-        "html_output extracts any HTML doc — wire to LlamaCPP Visualizer HTML then Preview Image."
+        "Use media_mode to select none / image / video / audio input. "
+        "visualization=html forces HTML output and renders it to html_image. "
+        "html_render_width/height/delay_ms control the auto-render viewport "
+        "(right-click â†’ Convert to Input to wire them)."
     )
 
     async def run(
@@ -328,11 +436,17 @@ class LlamaCPPChat:
         think: bool,
         unique_id: str,
         format: str,
+        reset_session: bool = True,
+        media_mode: str = "none",
         visualization: str = "disabled",
-        reset_session: bool = False,
         options: dict | None = None,
         connectivity: dict | None = None,
         images=None,
+        video=None,
+        audio=None,
+        html_render_width: int = 800,
+        html_render_height: int = 600,
+        html_render_delay_ms: int = 500,
     ):
         if connectivity is None:
             raise ValueError("Connect a LlamaCPP Connectivity node.")
@@ -346,13 +460,46 @@ class LlamaCPPChat:
         debug           = bool(options and options.get("debug", False))
         request_options = _filter_enabled_options(options)
 
+        video_frame_step  = int(options.get("video_frame_step",  1))      if options else 1
+        video_max_frames  = int(options.get("video_max_frames",  60))     if options else 60
+        audio_max_seconds = float(options.get("audio_max_seconds", 30.0)) if options else 30.0
+
         loop = asyncio.get_event_loop()
 
+        # â”€â”€ Media: only the branch matching media_mode is used â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         images_b64: list[str] | None = None
-        if images is not None:
-            images_b64 = await loop.run_in_executor(None, _images_to_b64, images)
+        video_b64:  list[str] | None = None
+        audio_b64:  str | None = None
 
-        # Session keyed on node's unique_id
+        if media_mode == "image" and images is not None:
+            images_b64 = await loop.run_in_executor(None, _images_to_b64, images)
+            print(f"[LlamaCPP] image mode: {len(images_b64)} frame(s)")
+
+        elif media_mode == "video" and video is not None:
+            def _proc_video(v, step, max_f):
+                sampled = _sample_video_frames(v, max_frames=max_f, frame_step=step)
+                print(f"[LlamaCPP] video mode: {len(v)} source â†’ {len(sampled)} frames")
+                return _images_to_b64(sampled)
+            video_b64 = await loop.run_in_executor(
+                None, _proc_video, video, video_frame_step, video_max_frames
+            )
+
+        elif media_mode == "audio" and audio is not None:
+            def _proc_audio(a, max_sec):
+                waveform    = a["waveform"]
+                sample_rate = a["sample_rate"]
+                # ComfyUI waveform shape: [batch, channels, samples] â€” squeeze batch
+                if waveform.dim() == 3:
+                    waveform = waveform.squeeze(0)
+                return _audio_tensor_to_b64(waveform, sample_rate, max_sec)
+            audio_b64, _ = await loop.run_in_executor(
+                None, _proc_audio, audio, audio_max_seconds
+            )
+            print(f"[LlamaCPP] audio mode: encoded")
+
+        # media_mode == "none" â†’ no media processing, text only
+
+        # â”€â”€ Session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if reset_session:
             CHAT_SESSIONS.pop(unique_id, None)
         if unique_id not in CHAT_SESSIONS:
@@ -370,8 +517,9 @@ class LlamaCPPChat:
                 "Start with <!DOCTYPE html> and end with </html>."
             )
             user_suffix = (
-                "\n\nOutput ONLY a complete HTML document. "
-                "Begin your response with <!DOCTYPE html> and end with </html>. "
+                f"\n\nOutput ONLY a complete HTML document. "
+                f"Begin your response with <!DOCTYPE html> and end with </html>. "
+                f"Ensure all content is visible within a {html_render_width}x{html_render_height} viewport. "
                 "No other text."
             )
 
@@ -385,13 +533,28 @@ class LlamaCPPChat:
         chat_session.messages.append({"role": "user", "content": user_content})
         messages_for_api = copy.deepcopy(chat_session.messages)
 
-        if images_b64:
-            last = messages_for_api[-1]
-            last["content"] = [{"type": "text", "text": prompt}] + [
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}}
-                for b in images_b64
-            ]
+        # â”€â”€ Build multimodal content block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        has_multimodal = bool(images_b64 or video_b64 or audio_b64)
+        if has_multimodal:
+            content: list[dict] = [{"type": "text", "text": user_content}]
 
+            if images_b64:
+                for b in images_b64:
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{b}"}})
+
+            if video_b64:
+                for b in video_b64:
+                    content.append({"type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{b}"}})
+
+            if audio_b64:
+                content.append({"type": "input_audio",
+                                 "input_audio": {"data": audio_b64, "format": "wav"}})
+
+            messages_for_api[-1]["content"] = content
+
+        # â”€â”€ keep_alive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if keep_alive_raw == -1:
             keep_alive_val = -1
         elif keep_alive_raw == 0:
@@ -411,19 +574,20 @@ class LlamaCPPChat:
 
         payload["chat_template_kwargs"] = {"enable_thinking": think}
         payload["reasoning_format"]     = "deepseek" if think else "none"
-        print(f"[LlamaCPP] think={think} enable_thinking={think} reasoning_format={payload['reasoning_format']}")
+        print(f"[LlamaCPP] think={think} reasoning_format={payload['reasoning_format']}")
 
         if request_options:
             for src, dst in {
-                "temperature":    "temperature",
-                "top_p":          "top_p",
-                "top_k":          "top_k",
-                "repeat_penalty": "frequency_penalty",
-                "num_predict":    "max_tokens",
-                "seed":           "seed",
-                "stop":           "stop",
-                "num_ctx":        "n_ctx",
-                "main_gpu":       "main_gpu",
+                "temperature":     "temperature",
+                "top_p":           "top_p",
+                "top_k":           "top_k",
+                "repeat_penalty":  "frequency_penalty",
+                "num_predict":     "max_tokens",
+                "seed":            "seed",
+                "stop":            "stop",
+                "num_ctx":         "n_ctx",
+                "main_gpu":        "main_gpu",
+                "thinking_budget": "thinking_budget",
             }.items():
                 if src in request_options:
                     payload[dst] = request_options[src]
@@ -439,7 +603,8 @@ class LlamaCPPChat:
 
         choices = response_data.get("choices", [])
         if not choices:
-            return ("Error: empty response", "", "")
+            return ("Error: empty response", "",
+                    _blank_tensor(html_render_width, html_render_height))
 
         message       = choices[0].get("message", {})
         result_text   = message.get("content", "") or ""
@@ -452,22 +617,33 @@ class LlamaCPPChat:
 
         chat_session.messages.append({"role": "assistant", "content": result_text})
 
-        # --- Extract HTML ---
-        html_output = ""
-        hm = re.search(r"<!DOCTYPE[\s\S]*?</html>", result_text, re.IGNORECASE)
-        if not hm:
-            hm = re.search(r"<html[\s\S]*?</html>", result_text, re.IGNORECASE)
-        if hm:
-            html_output = hm.group(0)
-            print(f"[LlamaCPP] html_output: {len(html_output)} chars")
-        else:
-            stripped = re.sub(r"```[a-zA-Z]*\n", "", result_text)
-            stripped = re.sub(r"```", "", stripped).strip()
-            if stripped.startswith("<!") or stripped.lower().startswith("<html"):
-                html_output = stripped
-                print(f"[LlamaCPP] html_output from stripped fences: {len(html_output)} chars")
+        # â”€â”€ Extract and auto-render HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        html_tensor = _blank_tensor(html_render_width, html_render_height)
+        if visualization == "html":
+            html_output = ""
+            hm = re.search(r"<!DOCTYPE[\s\S]*?</html>", result_text, re.IGNORECASE)
+            if not hm:
+                hm = re.search(r"<html[\s\S]*?</html>", result_text, re.IGNORECASE)
+            if hm:
+                html_output = hm.group(0)
+                print(f"[LlamaCPP] html extracted: {len(html_output)} chars")
             else:
-                print(f"[LlamaCPP] html_output: no HTML found in response")
+                stripped = re.sub(r"```[a-zA-Z]*\n", "", result_text)
+                stripped = re.sub(r"```", "", stripped).strip()
+                if stripped.startswith("<!") or stripped.lower().startswith("<html"):
+                    html_output = stripped
+                    print(f"[LlamaCPP] html extracted from stripped fences: {len(html_output)} chars")
+                else:
+                    print("[LlamaCPP] no HTML found in response")
+
+            if html_output:
+                img, err = _render_html(html_output, html_render_width,
+                                        html_render_height, html_render_delay_ms)
+                if err:
+                    print(f"[LlamaCPP] html_image render error: {err}")
+                else:
+                    html_tensor = _pil_to_tensor(img)
+                    print(f"[LlamaCPP] html_image rendered: {img.size}")
 
         if keep_alive_raw == 0:
             try:
@@ -475,7 +651,7 @@ class LlamaCPPChat:
             except Exception:
                 pass
 
-        return (result_text, thinking_text, html_output)
+        return (result_text, thinking_text, html_tensor)
 
 
 # ---------------------------------------------------------------------------
