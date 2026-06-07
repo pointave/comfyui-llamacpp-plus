@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-llamacpp-plus"
-description = "Access llama.cpp server, plus ease-of-life functionality"
-version = "1.0.0"
+description = "Access llama.cpp server and openai tts server, plus ease-of-life functionality"
+version = "1.2.0"
 license = {file = "LICENSE"} 
 classifiers = [
     "Operating System :: Microsoft :: Windows",
