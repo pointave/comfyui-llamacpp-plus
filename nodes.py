@@ -670,11 +670,294 @@ class LlamaCPPChat:
 # Registration
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# OpenAI TTS Nodes
+# ---------------------------------------------------------------------------
+
+import tempfile as _tempfile
+import wave as _wave
+import struct as _struct
+import numpy as _np
+import os as _os
+from openai import OpenAI as _OpenAI
+
+
+@PromptServer.instance.routes.post("/openai_tts/get_models")
+async def openai_tts_get_models(request):
+    data = await request.json()
+    url = data.get("url", "").rstrip("/") + "/v1/models"
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _get, url)
+        models = [m["id"] for m in result.get("data", [])]
+        return web.json_response(models)
+    except Exception as e:
+        print(f"[OpenAI TTS] Error fetching models: {e}")
+        return web.json_response([], status=500)
+
+
+@PromptServer.instance.routes.post("/openai_tts/unload_model")
+async def openai_tts_unload_model(request):
+    data = await request.json()
+    base_url = data.get("url", "").rstrip("/")
+    model = data.get("model", "")
+    loop = asyncio.get_event_loop()
+    try:
+        msg = await loop.run_in_executor(
+            None, lambda: _do_tts_unload_sync(base_url, model)
+        )
+        return web.json_response({"status": "ok", "method": msg})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.post("/openai_tts/reload_model")
+async def openai_tts_reload_model(request):
+    data = await request.json()
+    base_url = data.get("url", "").rstrip("/")
+    loop = asyncio.get_event_loop()
+    try:
+        msg = await loop.run_in_executor(
+            None, lambda: _do_tts_reload_sync(base_url)
+        )
+        return web.json_response({"status": "ok", "method": msg})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+@PromptServer.instance.routes.post("/openai_tts/generate_speech")
+async def openai_tts_generate(request):
+    data = await request.json()
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: _do_tts_generate(
+                data.get("base_url", ""),
+                data.get("model", ""),
+                data.get("voice", ""),
+                data.get("text", ""),
+                data.get("speed", 1.0),
+            ),
+        )
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+def _do_tts_unload_sync(base_url: str, model: str) -> str:
+    """Try multiple unload endpoints for TTS servers."""
+    candidates = [
+        (f"{base_url}/v1/models/unload", {}),              # OmniVoice
+        (f"{base_url}/v1/audio/unload", {}),               # tts_webui_extension
+        (f"{base_url}/v1/models/unload", {"model": model}),
+        (f"{base_url}/models/unload", {}),
+        (f"{base_url}/models/unload", {"model": model}),
+        (f"{base_url}/api/v1/models/unload", {"identifier": model}),
+    ]
+    for unload_url, body in candidates:
+        try:
+            r = _HTTP.post(unload_url, json=body, timeout=10)
+            if r.status_code in (200, 204):
+                return f"unloaded via {unload_url}"
+        except Exception:
+            pass
+    return "unload failed – no endpoint responded"
+
+
+def _do_tts_reload_sync(base_url: str) -> str:
+    """Try to reload the TTS model."""
+    candidates = [
+        (f"{base_url}/v1/models/reload", {}),              # OmniVoice
+        (f"{base_url}/v1/audio/reload", {}),               # tts_webui_extension
+    ]
+    for reload_url, body in candidates:
+        try:
+            r = _HTTP.post(reload_url, json=body, timeout=60)
+            if r.status_code in (200, 204):
+                return f"reloaded via {reload_url}"
+        except Exception:
+            pass
+    return "reload failed – no endpoint responded"
+
+
+def _save_audio_tensor_to_wav(waveform, sample_rate: int) -> str:
+    """Save a ComfyUI audio tensor to a temporary WAV file."""
+    import torch
+    audio_np = waveform.cpu().numpy()
+    if audio_np.ndim == 3:
+        audio_np = audio_np[0]  # squeeze batch dim
+    if audio_np.ndim == 1:
+        audio_np = audio_np[_np.newaxis, :]  # ensure [channels, samples]
+    audio_np = _np.clip(audio_np, -1.0, 1.0)
+    pcm = (audio_np * 32767).astype(_np.int16)
+    n_channels, n_samples = pcm.shape
+    fd, path = _tempfile.mkstemp(suffix=".wav")
+    _os.close(fd)
+    with _wave.open(path, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.T.flatten().tobytes())
+    return path
+
+
+def _do_tts_generate(base_url: str, model: str, voice: str, text: str, speed: float) -> dict:
+    """Generate speech via an OpenAI-compatible TTS server and return WAV bytes."""
+    client = _OpenAI(base_url=base_url, api_key="dummy")
+    speed = float(speed)
+    with client.audio.speech.with_streaming_response.create(
+        model=model,
+        voice=voice,
+        input=text,
+        extra_body={"speed": speed},
+    ) as response:
+        fd, path = _tempfile.mkstemp(suffix=".wav")
+        _os.close(fd)
+        response.stream_to_file(path)
+    with open(path, "rb") as f:
+        wav_bytes = f.read()
+    _os.unlink(path)
+    return {"wav_bytes": wav_bytes}
+
+
+class OpenAITTSConnectivity:
+    """Connectivity node for OpenAI-compatible TTS servers (e.g., Omnivoice)."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "url":   ("STRING", {"multiline": False, "default": "http://127.0.0.1:7778"}),
+            "model": ((), {}),
+        }}
+
+    @classmethod
+    def VALIDATE_INPUTS(s, url, model):
+        return True
+
+    RETURN_TYPES = ("OPENAI_TTS_CONN",)
+    RETURN_NAMES = ("tts_connection",)
+    FUNCTION = "run"
+    CATEGORY = "LlamaCPP API"
+
+    def run(self, url, model):
+        return ({"url": url.rstrip("/"), "model": model},)
+
+
+class OpenAITTSSpeech:
+    """
+    Text-to-speech node for OpenAI-compatible TTS servers (Omnivoice, etc.).
+
+    voice_path  — absolute path to a reference audio file (.wav/.mp3/.ogg)
+    voice_audio  — alternatively, wire an AUDIO node; it will be saved
+                   to a temp file and used as the voice reference.
+                   voice_audio takes priority over voice_path.
+    speed       — playback speed multiplier (0.5 — 2.0)
+    """
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text":       ("STRING", {"multiline": True, "default": "Hello, world!"}),
+                "voice_path": ("STRING", {"multiline": False,
+                                           "default": "",
+                                           "tooltip": "Path to a reference audio file (.wav/.mp3/.ogg) for voice cloning."}),
+                "speed":      ("FLOAT",  {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05,
+                                           "tooltip": "Speech speed multiplier (0.5 = slow, 2.0 = fast)."}),
+            },
+            "optional": {
+                "tts_connection": ("OPENAI_TTS_CONN", {"forceInput": False,
+                                                       "tooltip": "Wire an OpenAI TTS Connectivity node."}),
+                "voice_audio":    ("AUDIO", {"forceInput": False,
+                                              "tooltip": "Alternatively, wire an AUDIO clip as the voice reference."}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "run"
+    CATEGORY = "LlamaCPP API"
+    DESCRIPTION = (
+        "Generate speech using an OpenAI-compatible TTS server (e.g., Omnivoice). "
+        "Provide a voice reference via voice_path or by wiring an AUDIO input."
+    )
+
+    def run(self, text, voice_path, speed, tts_connection=None, voice_audio=None):
+        if tts_connection is None:
+            raise ValueError("Connect an OpenAI TTS Connectivity node.")
+
+        url = tts_connection["url"].rstrip("/")
+        model = tts_connection["model"]
+        base_url = url + "/v1"
+
+        # Resolve voice reference
+        voice_ref = voice_path
+        temp_voices = []
+
+        if voice_audio is not None:
+            # AUDIO input takes priority — save to temp WAV
+            waveform = voice_audio["waveform"]
+            sample_rate = voice_audio["sample_rate"]
+            voice_ref = _save_audio_tensor_to_wav(waveform, sample_rate)
+            temp_voices.append(voice_ref)
+        elif not voice_ref or not _os.path.isfile(voice_ref):
+            raise ValueError(
+                "No voice reference provided. Either set voice_path to an audio file "
+                "or wire an AUDIO input to voice_audio."
+            )
+
+        try:
+            client = _OpenAI(base_url=base_url, api_key="dummy")
+            speed_clamped = max(0.5, min(2.0, float(speed)))
+
+            with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice_ref,
+                input=text,
+                extra_body={"speed": speed_clamped},
+            ) as response:
+                fd, out_path = _tempfile.mkstemp(suffix=".wav")
+                _os.close(fd)
+                response.stream_to_file(out_path)
+
+            # Read the WAV and convert to ComfyUI AUDIO tensor
+            with _wave.open(out_path, "rb") as wf:
+                n_channels = wf.getnchannels()
+                sample_rate = wf.getframerate()
+                n_frames = wf.getnframes()
+                raw = wf.readframes(n_frames)
+                samples = _struct.unpack(
+                    f"<{n_frames * n_channels}h", raw
+                )
+                samples = _np.array(samples, dtype=_np.float32) / 32767.0
+                samples = samples.reshape(n_channels, n_frames)
+
+            _os.unlink(out_path)
+
+            import torch
+            waveform_tensor = torch.from_numpy(samples).unsqueeze(0)  # [1, ch, samples]
+            return ({"waveform": waveform_tensor, "sample_rate": sample_rate},)
+
+        finally:
+            for v in temp_voices:
+                try:
+                    _os.unlink(v)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 NODE_CLASS_MAPPINGS = {
     "LlamaCPPOptions":        LlamaCPPOptions,
     "LlamaCPPConnectivity":   LlamaCPPConnectivity,
     "LlamaCPPChat":           LlamaCPPChat,
     "LlamaCPPVisualizerHTML": LlamaCPPVisualizerHTML,
+    "OpenAITTSConnectivity":  OpenAITTSConnectivity,
+    "OpenAITTSSpeech":        OpenAITTSSpeech,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -682,4 +965,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaCPPConnectivity":   "LlamaCPP Connectivity",
     "LlamaCPPChat":           "LlamaCPP Chat",
     "LlamaCPPVisualizerHTML": "LlamaCPP Visualizer HTML",
+    "OpenAITTSConnectivity":  "OpenAI TTS Connectivity",
+    "OpenAITTSSpeech":        "OpenAI TTS Speech",
 }
