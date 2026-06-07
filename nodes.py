@@ -324,36 +324,26 @@ class LlamaCPPConnectivity:
 
 class LlamaCPPVisualizerHTML:
     """
-    Renders an HTML string to a ComfyUI IMAGE via Playwright (Chromium headless).
-    Wire result from LlamaCPPChat â†’ html, then IMAGE â†’ Preview Image node.
+    HTML render-settings node. Wire its output into LlamaCPPChat -> viz_settings.
+    Controls the Playwright viewport used when LlamaCPPChat renders html_image.
     pip install playwright && playwright install chromium
     """
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "html":        ("STRING", {"forceInput": True}),
-            "width":       ("INT",    {"default": 800, "min": 64, "max": 4096, "step": 8}),
-            "height":      ("INT",    {"default": 600, "min": 64, "max": 4096, "step": 8}),
-            "js_delay_ms": ("INT",    {"default": 500, "min": 0,  "max": 5000, "step": 100,
-                                       "tooltip": "ms to wait for JS to execute before screenshot"}),
+            "width":       ("INT", {"default": 800, "min": 64, "max": 4096, "step": 8}),
+            "height":      ("INT", {"default": 600, "min": 64, "max": 4096, "step": 8}),
+            "js_delay_ms": ("INT", {"default": 500, "min": 0,  "max": 5000, "step": 100,
+                                    "tooltip": "ms to wait for JS to execute before screenshot"}),
         }}
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("LLAMACPP_VIZ_SETTINGS",)
+    RETURN_NAMES = ("viz_settings",)
     FUNCTION = "run"
     CATEGORY = "LlamaCPP API"
 
-    def run(self, html: str, width: int = 800, height: int = 600, js_delay_ms: int = 500):
-        if not html or not html.strip():
-            print("[LlamaCPP HTML] empty input â€” nothing to render")
-            return (_blank_tensor(width, height),)
-        img, err = _render_html(html, width, height, js_delay_ms)
-        if err:
-            print(f"[LlamaCPP HTML] ERROR: {err}")
-            return (_blank_tensor(width, height),)
-        print(f"[LlamaCPP HTML] OK â€” rendered {img.size}")
-        return (_pil_to_tensor(img),)
-
+    def run(self, width: int = 800, height: int = 600, js_delay_ms: int = 500):
+        return ({"width": width, "height": height, "js_delay_ms": js_delay_ms},)
 
 class LlamaCPPChat:
     """
@@ -389,6 +379,9 @@ class LlamaCPPChat:
                                                      "none=text only (inputs ignored even if wired), "
                                                      "image=still frames, video=temporal batch, "
                                                      "audio=AUDIO input (Gemma4 E2B/E4B only)"}),
+                "visualization":        (["disabled", "html"], {"default": "disabled",
+                                          "tooltip": "html: forces full HTML document output and "
+                                                     "renders the result to html_image via Playwright."}),
             },
             "optional": {
                 "connectivity":         ("LLAMACPP_CONNECTIVITY", {"forceInput": False}),
@@ -403,15 +396,11 @@ class LlamaCPPChat:
                 "audio":                ("AUDIO", {"forceInput": False,
                                           "tooltip": "Active when media_mode=audio. "
                                                      "Gemma4 E2B/E4B only. Max 30 s."}),
-                # â”€â”€ HTML render size (for html_image auto-render) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                # Right-click any of these â†’ Convert to Input to wire a Primitive.
-                "html_render_width":    ("INT",   {"default": 800,  "min": 64, "max": 4096, "step": 8}),
-                "html_render_height":   ("INT",   {"default": 600,  "min": 64, "max": 4096, "step": 8}),
-                "html_render_delay_ms": ("INT",   {"default": 500,  "min": 0,  "max": 5000, "step": 100}),
-                # â”€â”€ Visualization mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                "visualization":        (["disabled", "html"], {"default": "disabled",
-                                          "tooltip": "html â†’ forces HTML doc output and "
-                                                     "renders the result to html_image"}),
+                # ─── Visualization settings ──────────────────────────────────────
+                "viz_settings":         ("LLAMACPP_VIZ_SETTINGS",
+                                          {"tooltip": "Wire a LlamaCPP Visualizer HTML node to "
+                                                       "control render width/height/delay. "
+                                                       "Optional — defaults to 800x600."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -424,9 +413,9 @@ class LlamaCPPChat:
     DESCRIPTION = (
         "Chat with llama.cpp. "
         "Use media_mode to select none / image / video / audio input. "
-        "visualization=html forces HTML output and renders it to html_image. "
-        "html_render_width/height/delay_ms control the auto-render viewport "
-        "(right-click â†’ Convert to Input to wire them)."
+        "Set visualization=html to force HTML output and render it to html_image. "
+        "Wire a LlamaCPP Visualizer HTML node to viz_settings to control render dimensions "
+        "(optional, defaults to 800x600)."
     )
 
     async def run(
@@ -444,9 +433,7 @@ class LlamaCPPChat:
         images=None,
         video=None,
         audio=None,
-        html_render_width: int = 800,
-        html_render_height: int = 600,
-        html_render_delay_ms: int = 500,
+        viz_settings: dict | None = None,
     ):
         if connectivity is None:
             raise ValueError("Connect a LlamaCPP Connectivity node.")
@@ -458,6 +445,13 @@ class LlamaCPPChat:
         keep_alive_raw  = conn.get("keep_alive", 5)
         keep_alive_unit = conn.get("keep_alive_unit", "minutes")
         debug           = bool(options and options.get("debug", False))
+
+        # ── viz_settings: connecting this node enables html mode ──────────
+        viz = viz_settings or {}
+        # viz_settings provides render dimensions; visualization param controls mode
+        html_render_width  = viz.get("width",       800)
+        html_render_height = viz.get("height",      600)
+        html_render_delay_ms = viz.get("js_delay_ms", 500)
         request_options = _filter_enabled_options(options)
 
         video_frame_step  = int(options.get("video_frame_step",  1))      if options else 1
@@ -569,12 +563,21 @@ class LlamaCPPChat:
             "keep_alive": keep_alive_val,
         }
 
-        if format == "json":
-            payload["response_format"] = {"type": "json_object"}
-
+        # reasoning_format=deepseek when think=True: server extracts <think> into
+        # reasoning_content rather than leaving raw tags in content.
+        # When think=False, reasoning_format=none so normal output is unaffected.
         payload["chat_template_kwargs"] = {"enable_thinking": think}
         payload["reasoning_format"]     = "deepseek" if think else "none"
-        print(f"[LlamaCPP] think={think} reasoning_format={payload['reasoning_format']}")
+
+        # json_object grammar conflicts with reasoning_format=deepseek when
+        # thinking is enabled — skip response_format in that case.
+        if format == "json":
+            if think:
+                print("[LlamaCPP] WARNING: json format skipped while think=True "
+                      "(grammar conflicts with reasoning_format=deepseek)")
+            else:
+                payload["response_format"] = {"type": "json_object"}
+        print(f"[LlamaCPP] think={think} format={format} reasoning_format=deepseek")
 
         if request_options:
             for src, dst in {
@@ -609,7 +612,10 @@ class LlamaCPPChat:
         message       = choices[0].get("message", {})
         result_text   = message.get("content", "") or ""
         raw_thinking  = message.get("reasoning_content", "") or ""
-        thinking_text = raw_thinking if think else ""
+        # reasoning_content is always extracted by the server when present.
+        # When think=False, enable_thinking=False means the model won't produce
+        # thinking tokens, so raw_thinking will naturally be empty.
+        thinking_text = raw_thinking
 
         if think and not raw_thinking:
             print("[LlamaCPP] WARNING: think=True but reasoning_content empty. "
@@ -617,9 +623,11 @@ class LlamaCPPChat:
 
         chat_session.messages.append({"role": "assistant", "content": result_text})
 
-        # â”€â”€ Extract and auto-render HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Extract and auto-render HTML ──────────────────────────────────────
+        print(f"[LlamaCPP] DEBUG: visualization={repr(visualization)} result_text[:200]={repr(result_text[:200])}")
         html_tensor = _blank_tensor(html_render_width, html_render_height)
         if visualization == "html":
+            print("[LlamaCPP] DEBUG: entering html branch")
             html_output = ""
             hm = re.search(r"<!DOCTYPE[\s\S]*?</html>", result_text, re.IGNORECASE)
             if not hm:
@@ -630,13 +638,15 @@ class LlamaCPPChat:
             else:
                 stripped = re.sub(r"```[a-zA-Z]*\n", "", result_text)
                 stripped = re.sub(r"```", "", stripped).strip()
-                if stripped.startswith("<!") or stripped.lower().startswith("<html"):
+                if stripped.startswith("<!") or stripped.lower().startswith("<html>"):
                     html_output = stripped
                     print(f"[LlamaCPP] html extracted from stripped fences: {len(html_output)} chars")
                 else:
                     print("[LlamaCPP] no HTML found in response")
+                    print(f"[LlamaCPP] DEBUG: stripped[:300]={repr(stripped[:300])}")
 
             if html_output:
+                print(f"[LlamaCPP] DEBUG: calling _render_html({html_render_width}x{html_render_height}, delay={html_render_delay_ms})")
                 img, err = _render_html(html_output, html_render_width,
                                         html_render_height, html_render_delay_ms)
                 if err:
@@ -644,6 +654,8 @@ class LlamaCPPChat:
                 else:
                     html_tensor = _pil_to_tensor(img)
                     print(f"[LlamaCPP] html_image rendered: {img.size}")
+        else:
+            print("[LlamaCPP] DEBUG: visualization is NOT html, skipping render")
 
         if keep_alive_raw == 0:
             try:
