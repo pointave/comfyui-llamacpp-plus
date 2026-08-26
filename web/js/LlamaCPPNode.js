@@ -330,8 +330,10 @@ app.registerExtension({
         // ----------------------------------------------------------------
         urlWidget.callback = updateModels;
 
-        // Initial model fetch on node creation
-        await updateModels();
+        // Defer the initial fetch until workflow widget values are restored.
+        // onNodeCreated runs with the class default URL, while graph
+        // configuration completes synchronously in the same call stack.
+        setTimeout(() => updateModels(), 0);
       };
     }
   },
