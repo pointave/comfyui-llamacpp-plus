@@ -1,6 +1,6 @@
 # comfyui-llamacpp-plus
 
-A set of nodes to connect llama.cpp models to ComfyUI. Supports text, image, video, and audio inputs, multi-turn chat, HTML/chart visualization, model unloading, and reasoning mode.
+A set of nodes to connect llama.cpp models to ComfyUI. Supports text, image, video, and audio inputs, multi-turn chat, HTML/chart visualization, model unloading, and reasoning mode. Now with agentic use in mind!
 
 > If you want a UI to update and load your llama.cpp server and are on Windows, check out [Togglellama](https://github.com/pointave/Togglellama) to have a taskbar system tray icon that unloads model and has 
 8 custom flag presets.
@@ -10,6 +10,8 @@ A set of nodes to connect llama.cpp models to ComfyUI. Supports text, image, vid
 
 - **LlamaCPP Connectivity** — Set your server URL, model, and keep-alive behavior
 - **LlamaCPP Chat** — Main inference node. Supports multi-modal input, session memory, and HTML visualization
+- **LlamaCPP Unload Model** — Unloads the listed model at the start of the Run
+- **LlamaCPP Preload Model** — Warm up your LLM with option to clear loaded ComfyUI models
 - **LlamaCPP Options** — Optional sampling overrides (temperature, top-k, seed, context length, etc.)
 - **LlamaCPP Visualizer HTML** — Renders any HTML string to a ComfyUI IMAGE via Playwright
 - **OpenAI TTS Connectivity** -- Refresh will populate dropdown with model deployed
