@@ -11,9 +11,14 @@ from PIL import Image
 from typing import TYPE_CHECKING, Any
 from dataclasses import dataclass, field
 import asyncio
+import gc
+import threading
+import time
 import requests as _requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from comfy import model_management
+from comfy_api.latest import io
 
 if TYPE_CHECKING:
     import torch
@@ -51,6 +56,27 @@ def _get(url: str, timeout: int = 10) -> dict:
     return r.json()
 
 
+def _post_chat(url: str, payload: dict, timeout: int = 300, retries: int = 4) -> dict:
+    # llama-server answers /models/unload as soon as the teardown is queued,
+    # so a chat request that lands right after an unload can hit the server
+    # mid-teardown (or mid-reload) and get a 500. Ride that window out with
+    # a bounded backoff; only 5xx is retried, a dead server still fails fast.
+    delay = 1.0
+    for attempt in range(retries):
+        try:
+            return _post(url, payload, timeout)
+        except _requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            body = (e.response.text or "").strip()[:500] if e.response is not None else ""
+            if status < 500 or attempt == retries - 1:
+                if body:
+                    print(f"[LlamaCPP] request failed: {status} {body}")
+                raise
+            print(f"[LlamaCPP] server error {status} ({body}), retry in {delay:.0f}s")
+            time.sleep(delay)
+            delay *= 2
+
+
 # ---------------------------------------------------------------------------
 # Server routes
 # ---------------------------------------------------------------------------
@@ -85,15 +111,20 @@ async def unload_model_endpoint(request):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _do_unload_sync(base_url: str, model: str) -> str:
+def _do_unload_sync(base_url: str, model: str, timeout: float = 5) -> str:
+    # timeout is a total budget across all endpoint candidates, not per attempt
+    deadline = time.monotonic() + timeout
     candidates = [
         (f"{base_url}/models/unload",        {}),
         (f"{base_url}/models/unload",        {"model": model}),
         (f"{base_url}/api/v1/models/unload", {"identifier": model}),
     ]
     for unload_url, body in candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            r = _HTTP.post(unload_url, json=body, timeout=5)
+            r = _HTTP.post(unload_url, json=body, timeout=remaining)
             if r.status_code in (200, 204):
                 return f"unloaded via {unload_url}"
         except Exception:
@@ -117,6 +148,22 @@ def _filter_enabled_options(options: dict[str, Any] | None) -> dict[str, Any] | 
             key = enabler.replace("enable_", "")
             out[key] = options[key]
     return out or None
+
+
+def _strip_thinking_remnants(text: str) -> str:
+    # Models (Qwen3/QwQ style) can leak thinking into content even with
+    # enable_thinking=false. Remove it as one unit:
+    #   1. whole think-open ... think-close blocks (tags + everything inside)
+    #   2. any dangling open or close tag
+    #   3. a glued-on trailing thinking tail the server could not extract
+    text = re.sub("\\s*\\x3cthink\\x3e" + "[\\s\\S]*?" + "\\s*\\x3c/think\\x3e", " ", text)
+    text = re.sub("\\s*\\x3cthink\\x3e", " ", text)
+    text = re.sub("\\s*\\x3c/think\\x3e", " ", text)
+    m = re.search("^\\s*(Let me now (?:summarize|think|provide|answer)|Let me (?:summarize|think)|Now let me|Now I (?:will|summarize|think)|I will now)\\b", text, re.MULTILINE)
+    if m and "\\x3c/think\\x3e" not in text[m.start():]:
+        text = text[:m.start()]
+    return re.sub("\\n\\s\\n\\s", "\\n", text).rstrip()
+
 
 
 def _images_to_b64(images: list) -> list[str]:
@@ -203,7 +250,6 @@ def _render_html(text: str, width: int = 800, height: int = 600, js_delay: int =
     m = re.search(r"<!DOCTYPE[\s\S]*?</html>", text, re.IGNORECASE)
     if not m:
         m = re.search(r"<html[\s\S]*?</html>", text, re.IGNORECASE)
-    if m:
         html = m.group(0)
     else:
         stripped = re.sub(r"```[a-zA-Z]*\n", "", text)
@@ -252,6 +298,10 @@ class LlamaCPPOptions:
             "seed":                   ("INT",     {"default": seed, "min": 0,   "max": 2**31, "step": 1}),
             "enable_num_ctx":         ("BOOLEAN", {"default": False}),
             "num_ctx":                ("INT",     {"default": 2048, "min": 0,   "max": 2**31, "step": 1}),
+            "enable_num_predict":     ("BOOLEAN", {"default": False,
+                                        "tooltip": "Cap the number of tokens the model may generate "
+                                                   "(sent as max_tokens)."}),
+            "num_predict":            ("INT",     {"default": 2048, "min": 0,   "max": 2**31, "step": 1}),
             "enable_repeat_last_n":   ("BOOLEAN", {"default": False}),
             "repeat_last_n":          ("INT",     {"default": 64,   "min": -1,  "max": 64,    "step": 1}),
             "enable_repeat_penalty":  ("BOOLEAN", {"default": False}),
@@ -283,6 +333,10 @@ class LlamaCPPOptions:
             "audio_max_seconds":      ("FLOAT",   {"default": 30.0, "min": 1.0, "max": 30.0, "step": 1.0,
                                         "tooltip": "Trim audio to this many seconds before sending. "
                                                    "Gemma4 E2B/E4B hard limit is 30 s."}),
+            # ─── Request ────────────────────────────────────────────────────────────────────────────
+            "request_timeout":        ("INT",     {"default": 300, "min": 1,   "max": 7200, "step": 15,
+                                        "tooltip": "Per-request HTTP timeout in seconds. "
+                                                   "Long generations (big thinking_budget, long num_predict) need more."}),
             # â”€â”€ Debug â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             "debug":                  ("BOOLEAN", {"default": False}),
         }}
@@ -371,14 +425,11 @@ class LlamaCPPChat:
             "required": {
                 "system":               ("STRING",  {"multiline": True,  "default": "You are an AI assistant."}),
                 "prompt":               ("STRING",  {"multiline": True,  "default": "Hello!"}),
-                "think":                ("BOOLEAN", {"default": False}),
+                "think_level":          (["off", "low", "med", "high", "veryhigh"],
+                                          {"default": "off"}),
                 "format":               (["text", "json"],),
                 "reset_session":        ("BOOLEAN", {"default": True}),
-                "media_mode":           (["none", "image", "video", "audio"], {"default": "none",
-                                          "tooltip": "Which optional media socket to process. "
-                                                     "none=text only (inputs ignored even if wired), "
-                                                     "image=still frames, video=temporal batch, "
-                                                     "audio=AUDIO input (Gemma4 E2B/E4B only)"}),
+                "media_mode":           (["none", "image", "video", "audio"], {"default": "none"}),
                 "visualization":        (["disabled", "html"], {"default": "disabled",
                                           "tooltip": "html: forces full HTML document output and "
                                                      "renders the result to html_image via Playwright."}),
@@ -422,7 +473,7 @@ class LlamaCPPChat:
         self,
         system: str,
         prompt: str,
-        think: bool,
+        think_level: str,
         unique_id: str,
         format: str,
         reset_session: bool = True,
@@ -457,6 +508,7 @@ class LlamaCPPChat:
         video_frame_step  = int(options.get("video_frame_step",  1))      if options else 1
         video_max_frames  = int(options.get("video_max_frames",  60))     if options else 60
         audio_max_seconds = float(options.get("audio_max_seconds", 30.0)) if options else 30.0
+        request_timeout   = int(options.get("request_timeout", 300))      if options else 300
 
         loop = asyncio.get_event_loop()
 
@@ -563,21 +615,24 @@ class LlamaCPPChat:
             "keep_alive": keep_alive_val,
         }
 
-        # reasoning_format=deepseek when think=True: server extracts <think> into
-        # reasoning_content rather than leaving raw tags in content.
-        # When think=False, reasoning_format=none so normal output is unaffected.
-        payload["chat_template_kwargs"] = {"enable_thinking": think}
-        payload["reasoning_format"]     = "deepseek" if think else "none"
+        think_on = think_level != "off"
+        effort_map = {"off": "none", "low": "low", "med": "medium",
+                      "high": "high", "veryhigh": "max"}
+        # reasoning_effort is template-driven: the chat template decides what a
+        # level actually means. enable_thinking=false still disables thinking
+        # on every template, so "off" works even where the template has no
+        # reasoning_effort support. deepseek format keeps thoughts out of
+        # content and into reasoning_content.
+        payload["reasoning_effort"]     = effort_map[think_level]
+        payload["chat_template_kwargs"] = {"enable_thinking": think_on}
+        # json_object grammar needs reasoning_format=deepseek at every think
+        # level: the Qwen template force-injects a thinking prefix token and
+        # only deepseek mode consumes it before the grammar applies.
+        payload["reasoning_format"]     = "deepseek" if (think_on or format == "json") else "none"
 
-        # json_object grammar conflicts with reasoning_format=deepseek when
-        # thinking is enabled — skip response_format in that case.
         if format == "json":
-            if think:
-                print("[LlamaCPP] WARNING: json format skipped while think=True "
-                      "(grammar conflicts with reasoning_format=deepseek)")
-            else:
-                payload["response_format"] = {"type": "json_object"}
-        print(f"[LlamaCPP] think={think} format={format} reasoning_format=deepseek")
+            payload["response_format"] = {"type": "json_object"}
+        print(f"[LlamaCPP] think={think_level} format={format}")
 
         if request_options:
             for src, dst in {
@@ -590,7 +645,7 @@ class LlamaCPPChat:
                 "stop":            "stop",
                 "num_ctx":         "n_ctx",
                 "main_gpu":        "main_gpu",
-                "thinking_budget": "thinking_budget",
+                "thinking_budget": "thinking_budget_tokens",
             }.items():
                 if src in request_options:
                     payload[dst] = request_options[src]
@@ -599,7 +654,7 @@ class LlamaCPPChat:
             print(f"[LlamaCPP] POST {api_url}")
             pprint(payload)
 
-        response_data = await loop.run_in_executor(None, lambda: _post(api_url, payload, 300))
+        response_data = await loop.run_in_executor(None, lambda: _post_chat(api_url, payload, request_timeout))
 
         if debug:
             pprint(response_data)
@@ -613,12 +668,13 @@ class LlamaCPPChat:
         result_text   = message.get("content", "") or ""
         raw_thinking  = message.get("reasoning_content", "") or ""
         # reasoning_content is always extracted by the server when present.
-        # When think=False, enable_thinking=False means the model won't produce
+        # When think=off, enable_thinking=False means the model won't produce
         # thinking tokens, so raw_thinking will naturally be empty.
         thinking_text = raw_thinking
+        result_text   = _strip_thinking_remnants(result_text)
 
-        if think and not raw_thinking:
-            print("[LlamaCPP] WARNING: think=True but reasoning_content empty. "
+        if think_on and not raw_thinking:
+            print(f"[LlamaCPP] WARNING: think={think_level} but reasoning_content empty. "
                   "Ensure llama-server started with --jinja")
 
         chat_session.messages.append({"role": "assistant", "content": result_text})
@@ -664,6 +720,175 @@ class LlamaCPPChat:
                 pass
 
         return (result_text, thinking_text, html_tensor)
+
+
+LLAMACPP_CONNECTIVITY = io.Custom("LLAMACPP_CONNECTIVITY")
+
+
+class LlamaCPPPreloadModel(io.ComfyNode):
+    """Load a llama.cpp model into memory ahead of time.
+
+    Wire a LlamaCPP Connectivity node into ``connectivity`` and pass any value
+    through ``anything``. The load starts as soon as this node runs, so drop it
+    exactly where you want the model warming up (e.g. early, while VRAM is free).
+    The load runs in a background thread and the passthrough is returned
+    immediately — it does not wait for the load to finish. The same value comes
+    back out ``output``, so it slots into an existing chain without changing its
+    type.
+
+    ``clear_vram`` (default on) first unloads all ComfyUI models and empties
+    the GPU cache — the same thing easy-use's Clean VRAM Used node does — so
+    the LLM has the freed VRAM to load into. Turn it off when the model fits in
+    the VRAM ComfyUI is not using.
+
+    Only triggers the load — keep_alive (0 = unload after use, -1 = keep
+    resident) is handled by the LlamaCPP Chat node.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LlamaCPPPreloadModel",
+            display_name="LlamaCPP Preload Model",
+            category="LlamaCPP API",
+            is_output_node=True,
+            not_idempotent=True,
+            description=(
+                "Kick off a llama.cpp model load in the background so the first "
+                "Chat request is fast. Optionally clears ComfyUI's VRAM first so "
+                "the model has room to load. Runs on every execution and passes "
+                "through immediately without waiting for the load to finish."
+            ),
+            inputs=[
+                LLAMACPP_CONNECTIVITY.Input(
+                    "connectivity",
+                    tooltip="Wire a LlamaCPP Connectivity node here.",
+                ),
+                io.AnyType.Input(
+                    "anything",
+                    tooltip="Passthrough. The load fires when this node runs, so "
+                            "wire it where you want the model warm.",
+                ),
+                io.Boolean.Input(
+                    "clear_vram",
+                    default=True,
+                    tooltip="Unload all ComfyUI models and empty the GPU cache "
+                            "first (like easy-use's Clean VRAM Used), freeing "
+                            "VRAM for the LLM. Turn off when the model fits."
+                ),
+            ],
+            outputs=[
+                io.AnyType.Output("output"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, **kwargs):
+        connectivity = kwargs["connectivity"]
+        anything = kwargs["anything"]
+        clear_vram = kwargs.get("clear_vram", True)
+
+        if clear_vram:
+            model_management.unload_all_models()
+            gc.collect()
+            model_management.soft_empty_cache()
+            print("[LlamaCPP] cleared ComfyUI VRAM for LLM preload")
+
+        url = connectivity["url"].rstrip("/")
+        model = connectivity["model"]
+
+        def _load():
+            try:
+                _post(
+                    f"{url}/v1/chat/completions",
+                    {
+                        "model": model,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 1,
+                    },
+                    timeout=600,
+                )
+                print(f"[LlamaCPP] preloaded model {model}")
+            except Exception as e:
+                print(f"[LlamaCPP] preload of {model} failed: {e}")
+
+        threading.Thread(target=_load, daemon=True).start()
+        print(f"[LlamaCPP] preload started for {model} (background)")
+        return io.NodeOutput(anything)
+
+
+class LlamaCPPUnloadModel(io.ComfyNode):
+    """Unload a llama.cpp model from memory.
+
+    Wire a LlamaCPP Connectivity node into ``connectivity`` — that's the only
+    input. The node has no outputs: drop it anywhere in the workflow and it
+    always runs first (see the PromptQueue patch in __init__.py), blocking
+    until the model is actually freed, so anything else — typically the
+    diffusion model loaders — starts only after the LLM's VRAM is back. If
+    the server is unreachable the wait is capped at 1 second.
+
+    Mirrors the keep_alive=0 behavior of the LlamaCPP Chat node, but as an
+    explicit point in the graph.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="LlamaCPPUnloadModel",
+            display_name="LlamaCPP Unload Model",
+            category="LlamaCPP API",
+            is_output_node=True,
+            not_idempotent=True,
+            description=(
+                "Unload a llama.cpp model from memory. No outputs — always runs "
+                "first in the workflow and waits for the model to be freed "
+                "before any other node starts, so VRAM is available for what "
+                "comes next."
+            ),
+            inputs=[
+                LLAMACPP_CONNECTIVITY.Input(
+                    "connectivity",
+                    tooltip="Wire a LlamaCPP Connectivity node here.",
+                ),
+            ],
+        )
+
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+        # Never reuse a cached output: the node is a side effect and must run
+        # on every prompt.
+        return float("nan")
+
+    @classmethod
+    def execute(cls, **kwargs):
+        connectivity = kwargs["connectivity"]
+
+        url = connectivity["url"].rstrip("/")
+        model = connectivity["model"]
+
+        try:
+            print(f"[LlamaCPP] {model}: {_do_unload_sync(url, model, timeout=1)}")
+        except Exception as e:
+            print(f"[LlamaCPP] unload of {model} failed: {e}")
+
+        # The /models/unload ack means the teardown is only *queued*; wait for
+        # the server to actually report the model as unloaded (capped, so an
+        # unreachable server can't stall the workflow) before releasing the
+        # rest of the graph — typically the 21 GB diffusion loaders.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                data = _get(f"{url}/v1/models", timeout=2).get("data", [])
+                hits = [m for m in data if model in m.get("id", "")]
+                def _status(m):
+                    st = m.get("status")
+                    return st.get("value") if isinstance(st, dict) else st
+                if not hits or all(_status(m) == "unloaded" for m in hits):
+                    break
+                time.sleep(0.5)
+            except Exception:
+                break
+        return io.NodeOutput()
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1181,8 @@ NODE_CLASS_MAPPINGS = {
     "LlamaCPPConnectivity":   LlamaCPPConnectivity,
     "LlamaCPPChat":           LlamaCPPChat,
     "LlamaCPPVisualizerHTML": LlamaCPPVisualizerHTML,
+    "LlamaCPPPreloadModel":   LlamaCPPPreloadModel,
+    "LlamaCPPUnloadModel":    LlamaCPPUnloadModel,
     "OpenAITTSConnectivity":  OpenAITTSConnectivity,
     "OpenAITTSSpeech":        OpenAITTSSpeech,
 }
@@ -965,6 +1192,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LlamaCPPConnectivity":   "LlamaCPP Connectivity",
     "LlamaCPPChat":           "LlamaCPP Chat",
     "LlamaCPPVisualizerHTML": "LlamaCPP Visualizer HTML",
+    "LlamaCPPPreloadModel":   "LlamaCPP Preload Model",
+    "LlamaCPPUnloadModel":    "LlamaCPP Unload Model",
     "OpenAITTSConnectivity":  "OpenAI TTS Connectivity",
     "OpenAITTSSpeech":        "OpenAI TTS Speech",
 }
