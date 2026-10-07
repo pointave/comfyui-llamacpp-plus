@@ -1,6 +1,6 @@
 # comfyui-llamacpp-plus
 
-A set of nodes to connect llama.cpp models to ComfyUI. Supports text, image, video, and audio inputs, multi-turn chat, HTML/chart visualization, model unloading, and reasoning mode. Now with agentic use in mind!
+A set of nodes to connect llama.cpp models to ComfyUI. Supports text, image, video, and audio inputs, multi-turn chat, HTML/chart visualization, model unloading, and reasoning mode. Now with agentic use in mind!  BREAKING CHANGE for Chat and Option node (sorry),  refresh Option and select a new reasoning level (got rid of Thinking On/Off)
 
 > If you want a UI to update and load your llama.cpp server and are on Windows, check out [Togglellama](https://github.com/pointave/Togglellama) to have a taskbar system tray icon that unloads model and has 
 8 custom flag presets.
