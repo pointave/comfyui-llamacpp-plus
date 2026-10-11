@@ -150,19 +150,27 @@ def _filter_enabled_options(options: dict[str, Any] | None) -> dict[str, Any] | 
     return out or None
 
 
-def _strip_thinking_remnants(text: str) -> str:
-    # Models (Qwen3/QwQ style) can leak thinking into content even with
-    # enable_thinking=false. Remove it as one unit:
-    #   1. whole think-open ... think-close blocks (tags + everything inside)
-    #   2. any dangling open or close tag
-    #   3. a glued-on trailing thinking tail the server could not extract
+def _strip_thinking_remnants(text: str) -> tuple[str, str]:
+    # Models can leak thinking into content even with enable_thinking=false,
+    # or the server may not know the model's thinking format. Remove it as
+    # one unit and return whatever thinking text was inside, so it can be
+    # surfaced on the thinking output:
+    #   Qwen3/QwQ style:  think-open ... think-close blocks (or dangling tags)
+    #   Gemma 4 style:    <|channel>thought ... <channel|> (or dangling open)
+    # plus a glued-on trailing thinking tail the server could not extract.
+    leaked = ""
+    m = re.search("\\s*\\x3c\\|channel\\x3ethought\\b" + "[\\s\\S]*?" + "\\s*\\x3cchannel\\|\\x3e", text)
+    if m:
+        leaked = re.sub("^\\s*\\x3c\\|channel\\x3ethought\\b|\\s*\\x3cchannel\\|\\x3e\\s*$", "", m.group(0)).strip()
+    text = re.sub("\\s*\\x3c\\|channel\\x3ethought\\b" + "[\\s\\S]*?" + "\\s*\\x3cchannel\\|\\x3e", " ", text)
+    text = re.sub("\\s*\\x3c\\|channel\\x3ethought\\b", " ", text)
     text = re.sub("\\s*\\x3cthink\\x3e" + "[\\s\\S]*?" + "\\s*\\x3c/think\\x3e", " ", text)
     text = re.sub("\\s*\\x3cthink\\x3e", " ", text)
     text = re.sub("\\s*\\x3c/think\\x3e", " ", text)
     m = re.search("^\\s*(Let me now (?:summarize|think|provide|answer)|Let me (?:summarize|think)|Now let me|Now I (?:will|summarize|think)|I will now)\\b", text, re.MULTILINE)
     if m and "\\x3c/think\\x3e" not in text[m.start():]:
         text = text[:m.start()]
-    return re.sub("\\n\\s\\n\\s", "\\n", text).rstrip()
+    return re.sub("\\n\\s\\n\\s", "\\n", text).strip(), leaked
 
 
 
@@ -181,7 +189,7 @@ def _images_to_b64(images: list) -> list[str]:
 def _sample_video_frames(images, max_frames: int = 60, frame_step: int = 1) -> list:
     """
     Sample frames from a video batch tensor.
-    frame_step=1 â†’ every frame; frame_step=2 â†’ every 2nd frame, etc.
+    frame_step=1 Ã¢â€ â€™ every frame; frame_step=2 Ã¢â€ â€™ every 2nd frame, etc.
     Result is hard-capped at max_frame.
     """
     total = len(images)
@@ -204,12 +212,12 @@ def _audio_tensor_to_b64(waveform, sample_rate: int, max_seconds: float = 30.0) 
         waveform = waveform[..., :max_samples]
         print(f"[LlamaCPP] Audio trimmed to {max_seconds}s")
 
-    # Convert to 16-bit PCM numpy â€” no torchaudio needed
+    # Convert to 16-bit PCM numpy Ã¢â‚¬â€ no torchaudio needed
     audio_np = waveform.cpu().numpy()                       # [channels, samples]
     if audio_np.ndim == 1:
         audio_np = audio_np[np.newaxis, :]                  # ensure [channels, samples]
     audio_np = np.clip(audio_np, -1.0, 1.0)
-    pcm = (audio_np * 32767).astype(np.int16)               # float32 â†’ int16
+    pcm = (audio_np * 32767).astype(np.int16)               # float32 Ã¢â€ â€™ int16
 
     n_channels, n_samples = pcm.shape
     buf = io.BytesIO()
@@ -217,7 +225,7 @@ def _audio_tensor_to_b64(waveform, sample_rate: int, max_seconds: float = 30.0) 
         wf.setnchannels(n_channels)
         wf.setsampwidth(2)                                   # 16-bit = 2 bytes
         wf.setframerate(sample_rate)
-        # wave expects interleaved samples: [L0,R0,L1,R1,...] â†’ transpose then flatten
+        # wave expects interleaved samples: [L0,R0,L1,R1,...] Ã¢â€ â€™ transpose then flatten
         wf.writeframes(pcm.T.flatten().tobytes())
     buf.seek(0)
     data = base64.b64encode(buf.read()).decode("utf-8")
@@ -293,7 +301,7 @@ class LlamaCPPOptions:
     def INPUT_TYPES(s):
         seed = random.randint(1, 2 ** 31)
         return {"required": {
-            # â”€â”€ Sampling â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Sampling Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "enable_seed":            ("BOOLEAN", {"default": False}),
             "seed":                   ("INT",     {"default": seed, "min": 0,   "max": 2**31, "step": 1}),
             "enable_num_ctx":         ("BOOLEAN", {"default": False}),
@@ -318,26 +326,26 @@ class LlamaCPPOptions:
             "min_p":                  ("FLOAT",   {"default": 0.0,  "min": 0,   "max": 1,     "step": 0.05}),
             "enable_main_gpu":        ("BOOLEAN", {"default": False}),
             "main_gpu":               ("INT",     {"default": 0,    "min": 0,   "max": 100,   "step": 1}),
-            # â”€â”€ Thinking budget (Gemma4 / QwQ style) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Thinking budget (Gemma4 / QwQ style) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "enable_thinking_budget": ("BOOLEAN", {"default": False,
                                         "tooltip": "Cap reasoning tokens (Gemma4, QwQ). 0 disables thinking entirely."}),
             "thinking_budget":        ("INT",     {"default": 1024, "min": 0,   "max": 32768, "step": 128}),
-            # â”€â”€ Video â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Video Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "video_frame_step":       ("INT",     {"default": 1,  "min": 1, "max": 60, "step": 1,
                                         "tooltip": "Sample every Nth source frame from the video input. "
                                                    "1 = every frame."}),
             "video_max_frames":       ("INT",     {"default": 60, "min": 1, "max": 60, "step": 1,
                                         "tooltip": "Hard cap on frames sent to model. "
                                                    "Video"}),
-            # â”€â”€ Audio â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Audio Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "audio_max_seconds":      ("FLOAT",   {"default": 30.0, "min": 1.0, "max": 30.0, "step": 1.0,
                                         "tooltip": "Trim audio to this many seconds before sending. "
                                                    "Gemma4 E2B/E4B hard limit is 30 s."}),
-            # ─── Request ────────────────────────────────────────────────────────────────────────────
+            # â”€â”€â”€ Request â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             "request_timeout":        ("INT",     {"default": 300, "min": 1,   "max": 7200, "step": 15,
                                         "tooltip": "Per-request HTTP timeout in seconds. "
                                                    "Long generations (big thinking_budget, long num_predict) need more."}),
-            # â”€â”€ Debug â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Ã¢â€â‚¬Ã¢â€â‚¬ Debug Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
             "debug":                  ("BOOLEAN", {"default": False}),
         }}
 
@@ -404,19 +412,19 @@ class LlamaCPPChat:
     Chat node for llama.cpp.  Supports text, images, video (frame batch), and audio.
 
     media_mode selects which optional socket is active:
-      none  â€” text only; media inputs are ignored even if wired
-      image â€” wire IMAGE for still frames
-      video â€” wire IMAGE batch treated as temporal video; sampling in Options
-      audio â€” wire AUDIO (Gemma4 E2B/E4B, 30 s max)
+      none  Ã¢â‚¬â€ text only; media inputs are ignored even if wired
+      image Ã¢â‚¬â€ wire IMAGE for still frames
+      video Ã¢â‚¬â€ wire IMAGE batch treated as temporal video; sampling in Options
+      audio Ã¢â‚¬â€ wire AUDIO (Gemma4 E2B/E4B, 30 s max)
 
     visualization injects HTML generation instructions into the system prompt:
-      disabled â€” system prompt used as-is
-      html     â€” overrides system prompt to force a full HTML document output;
+      disabled Ã¢â‚¬â€ system prompt used as-is
+      html     Ã¢â‚¬â€ overrides system prompt to force a full HTML document output;
                  html_image carries a Playwright-rendered IMAGE of it
 
     html_render_width / html_render_height / html_render_delay_ms
       Control the viewport used when auto-rendering html_image.
-      Right-click any of these â†’ Convert to Input to wire a Primitive.
+      Right-click any of these Ã¢â€ â€™ Convert to Input to wire a Primitive.
     """
 
     @classmethod
@@ -437,7 +445,7 @@ class LlamaCPPChat:
             "optional": {
                 "connectivity":         ("LLAMACPP_CONNECTIVITY", {"forceInput": False}),
                 "options":              ("LLAMACPP_OPTIONS",      {"forceInput": False}),
-                # â”€â”€ Media sockets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # Ã¢â€â‚¬Ã¢â€â‚¬ Media sockets Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 "images":               ("IMAGE", {"forceInput": False,
                                           "tooltip": "Active when media_mode=image"}),
                 "video":                ("IMAGE", {"forceInput": False,
@@ -447,11 +455,11 @@ class LlamaCPPChat:
                 "audio":                ("AUDIO", {"forceInput": False,
                                           "tooltip": "Active when media_mode=audio. "
                                                      "Gemma4 E2B/E4B only. Max 30 s."}),
-                # ─── Visualization settings ──────────────────────────────────────
+                # â”€â”€â”€ Visualization settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 "viz_settings":         ("LLAMACPP_VIZ_SETTINGS",
                                           {"tooltip": "Wire a LlamaCPP Visualizer HTML node to "
                                                        "control render width/height/delay. "
-                                                       "Optional — defaults to 800x600."}),
+                                                       "Optional â€” defaults to 800x600."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -497,7 +505,7 @@ class LlamaCPPChat:
         keep_alive_unit = conn.get("keep_alive_unit", "minutes")
         debug           = bool(options and options.get("debug", False))
 
-        # ── viz_settings: connecting this node enables html mode ──────────
+        # â”€â”€ viz_settings: connecting this node enables html mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         viz = viz_settings or {}
         # viz_settings provides render dimensions; visualization param controls mode
         html_render_width  = viz.get("width",       800)
@@ -512,7 +520,7 @@ class LlamaCPPChat:
 
         loop = asyncio.get_event_loop()
 
-        # â”€â”€ Media: only the branch matching media_mode is used â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Media: only the branch matching media_mode is used Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         images_b64: list[str] | None = None
         video_b64:  list[str] | None = None
         audio_b64:  str | None = None
@@ -524,7 +532,7 @@ class LlamaCPPChat:
         elif media_mode == "video" and video is not None:
             def _proc_video(v, step, max_f):
                 sampled = _sample_video_frames(v, max_frames=max_f, frame_step=step)
-                print(f"[LlamaCPP] video mode: {len(v)} source â†’ {len(sampled)} frames")
+                print(f"[LlamaCPP] video mode: {len(v)} source Ã¢â€ â€™ {len(sampled)} frames")
                 return _images_to_b64(sampled)
             video_b64 = await loop.run_in_executor(
                 None, _proc_video, video, video_frame_step, video_max_frames
@@ -534,7 +542,7 @@ class LlamaCPPChat:
             def _proc_audio(a, max_sec):
                 waveform    = a["waveform"]
                 sample_rate = a["sample_rate"]
-                # ComfyUI waveform shape: [batch, channels, samples] â€” squeeze batch
+                # ComfyUI waveform shape: [batch, channels, samples] Ã¢â‚¬â€ squeeze batch
                 if waveform.dim() == 3:
                     waveform = waveform.squeeze(0)
                 return _audio_tensor_to_b64(waveform, sample_rate, max_sec)
@@ -543,9 +551,9 @@ class LlamaCPPChat:
             )
             print(f"[LlamaCPP] audio mode: encoded")
 
-        # media_mode == "none" â†’ no media processing, text only
+        # media_mode == "none" Ã¢â€ â€™ no media processing, text only
 
-        # â”€â”€ Session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Session Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if reset_session:
             CHAT_SESSIONS.pop(unique_id, None)
         if unique_id not in CHAT_SESSIONS:
@@ -579,7 +587,7 @@ class LlamaCPPChat:
         chat_session.messages.append({"role": "user", "content": user_content})
         messages_for_api = copy.deepcopy(chat_session.messages)
 
-        # â”€â”€ Build multimodal content block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Build multimodal content block Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         has_multimodal = bool(images_b64 or video_b64 or audio_b64)
         if has_multimodal:
             content: list[dict] = [{"type": "text", "text": user_content}]
@@ -600,7 +608,7 @@ class LlamaCPPChat:
 
             messages_for_api[-1]["content"] = content
 
-        # â”€â”€ keep_alive â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Ã¢â€â‚¬Ã¢â€â‚¬ keep_alive Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if keep_alive_raw == -1:
             keep_alive_val = -1
         elif keep_alive_raw == 0:
@@ -671,7 +679,9 @@ class LlamaCPPChat:
         # When think=off, enable_thinking=False means the model won't produce
         # thinking tokens, so raw_thinking will naturally be empty.
         thinking_text = raw_thinking
-        result_text   = _strip_thinking_remnants(result_text)
+        result_text, leaked_thinking = _strip_thinking_remnants(result_text)
+        if leaked_thinking and not thinking_text:
+            thinking_text = leaked_thinking
 
         if think_on and not raw_thinking:
             print(f"[LlamaCPP] WARNING: think={think_level} but reasoning_content empty. "
@@ -679,7 +689,7 @@ class LlamaCPPChat:
 
         chat_session.messages.append({"role": "assistant", "content": result_text})
 
-        # ── Extract and auto-render HTML ──────────────────────────────────────
+        # â”€â”€ Extract and auto-render HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         print(f"[LlamaCPP] DEBUG: visualization={repr(visualization)} result_text[:200]={repr(result_text[:200])}")
         html_tensor = _blank_tensor(html_render_width, html_render_height)
         if visualization == "html":
@@ -732,16 +742,16 @@ class LlamaCPPPreloadModel(io.ComfyNode):
     through ``anything``. The load starts as soon as this node runs, so drop it
     exactly where you want the model warming up (e.g. early, while VRAM is free).
     The load runs in a background thread and the passthrough is returned
-    immediately — it does not wait for the load to finish. The same value comes
+    immediately â€” it does not wait for the load to finish. The same value comes
     back out ``output``, so it slots into an existing chain without changing its
     type.
 
     ``clear_vram`` (default on) first unloads all ComfyUI models and empties
-    the GPU cache — the same thing easy-use's Clean VRAM Used node does — so
+    the GPU cache â€” the same thing easy-use's Clean VRAM Used node does â€” so
     the LLM has the freed VRAM to load into. Turn it off when the model fits in
     the VRAM ComfyUI is not using.
 
-    Only triggers the load — keep_alive (0 = unload after use, -1 = keep
+    Only triggers the load â€” keep_alive (0 = unload after use, -1 = keep
     resident) is handled by the LlamaCPP Chat node.
     """
 
@@ -820,11 +830,11 @@ class LlamaCPPPreloadModel(io.ComfyNode):
 class LlamaCPPUnloadModel(io.ComfyNode):
     """Unload a llama.cpp model from memory.
 
-    Wire a LlamaCPP Connectivity node into ``connectivity`` — that's the only
+    Wire a LlamaCPP Connectivity node into ``connectivity`` â€” that's the only
     input. The node has no outputs: drop it anywhere in the workflow and it
     always runs first (see the PromptQueue patch in __init__.py), blocking
-    until the model is actually freed, so anything else — typically the
-    diffusion model loaders — starts only after the LLM's VRAM is back. If
+    until the model is actually freed, so anything else â€” typically the
+    diffusion model loaders â€” starts only after the LLM's VRAM is back. If
     the server is unreachable the wait is capped at 1 second.
 
     Mirrors the keep_alive=0 behavior of the LlamaCPP Chat node, but as an
@@ -840,7 +850,7 @@ class LlamaCPPUnloadModel(io.ComfyNode):
             is_output_node=True,
             not_idempotent=True,
             description=(
-                "Unload a llama.cpp model from memory. No outputs — always runs "
+                "Unload a llama.cpp model from memory. No outputs â€” always runs "
                 "first in the workflow and waits for the model to be freed "
                 "before any other node starts, so VRAM is available for what "
                 "comes next."
@@ -874,7 +884,7 @@ class LlamaCPPUnloadModel(io.ComfyNode):
         # The /models/unload ack means the teardown is only *queued*; wait for
         # the server to actually report the model as unloaded (capped, so an
         # unreachable server can't stall the workflow) before releasing the
-        # rest of the graph — typically the 21 GB diffusion loaders.
+        # rest of the graph â€” typically the 21 GB diffusion loaders.
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             try:
@@ -987,7 +997,7 @@ def _do_tts_unload_sync(base_url: str, model: str) -> str:
                 return f"unloaded via {unload_url}"
         except Exception:
             pass
-    return "unload failed – no endpoint responded"
+    return "unload failed â€“ no endpoint responded"
 
 
 def _do_tts_reload_sync(base_url: str) -> str:
@@ -1003,7 +1013,7 @@ def _do_tts_reload_sync(base_url: str) -> str:
                 return f"reloaded via {reload_url}"
         except Exception:
             pass
-    return "reload failed – no endpoint responded"
+    return "reload failed â€“ no endpoint responded"
 
 
 def _save_audio_tensor_to_wav(waveform, sample_rate: int) -> str:
@@ -1073,11 +1083,11 @@ class OpenAITTSSpeech:
     """
     Text-to-speech node for OpenAI-compatible TTS servers (Omnivoice, etc.).
 
-    voice_path  — absolute path to a reference audio file (.wav/.mp3/.ogg)
-    voice_audio  — alternatively, wire an AUDIO node; it will be saved
+    voice_path  â€” absolute path to a reference audio file (.wav/.mp3/.ogg)
+    voice_audio  â€” alternatively, wire an AUDIO node; it will be saved
                    to a temp file and used as the voice reference.
                    voice_audio takes priority over voice_path.
-    speed       — playback speed multiplier (0.5 — 2.0)
+    speed       â€” playback speed multiplier (0.5 â€” 2.0)
     """
 
     @classmethod
@@ -1121,7 +1131,7 @@ class OpenAITTSSpeech:
         temp_voices = []
 
         if voice_audio is not None:
-            # AUDIO input takes priority — save to temp WAV
+            # AUDIO input takes priority â€” save to temp WAV
             waveform = voice_audio["waveform"]
             sample_rate = voice_audio["sample_rate"]
             voice_ref = _save_audio_tensor_to_wav(waveform, sample_rate)
